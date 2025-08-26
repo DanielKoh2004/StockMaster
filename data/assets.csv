@@ -1,0 +1,36 @@
+asset_class,ticker,name
+Stocks,AAPL,Apple Inc.
+Stocks,MSFT,Microsoft Corporation
+Stocks,GOOGL,Alphabet Inc.
+Stocks,AMZN,Amazon.com Inc.
+Stocks,TSLA,Tesla Inc.
+Stocks,NVDA,NVIDIA Corporation
+Stocks,META,Meta Platforms Inc.
+Stocks,JPM,JP Morgan Chase & Co.
+Stocks,V,Visa Inc.
+Stocks,MA,Mastercard Incorporated
+Stocks,BAC,Bank of America Corp.
+Stocks,NFLX,Netflix Inc.
+Stocks,INTC,Intel Corporation
+Stocks,ORCL,Oracle Corporation
+Stocks,CRM,Salesforce, Inc.
+Stocks,PYPL,PayPal Holdings, Inc.
+Stocks,NKE,Nike, Inc.
+Stocks,PG,Procter & Gamble Co.
+Stocks,KO,Coca-Cola Co.
+Stocks,PFE,Pfizer Inc.
+Metals,GC=F,Gold Futures
+Metals,SI=F,Silver Futures
+Metals,HG=F,Copper Futures
+Metals,PL=F,Palladium Futures
+Metals,PA=F,Platinum Futures
+Metals,CL=F,Crude Oil Futures
+Metals,NG=F,Natural Gas Futures
+Cryptocurrencies,BTC-USD,Bitcoin
+Cryptocurrencies,ETH-USD,Ethereum
+Cryptocurrencies,BNB-USD,Binance Coin
+Cryptocurrencies,XRP-USD,Ripple (XRP)
+Cryptocurrencies,ADA-USD,Cardano
+Cryptocurrencies,SOL-USD,Solana
+Cryptocurrencies,DOT-USD,Polkadot
+Cryptocurrencies,LTC-USD,Litecoin
