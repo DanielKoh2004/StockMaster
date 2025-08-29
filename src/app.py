@@ -915,6 +915,28 @@ if PAGE == "Train":
                         status.markdown(status_text)
                         logs.insert(0, f"[fold] {status_text}")
                         logs_box.text_area("Training logs (most recent first)", value="\n".join(logs), height=260)
+                    elif t == "cv_results":
+                        mean_score = msg.get("mean_test_score")
+                        std_score = msg.get("std_test_score")
+                        split_scores = msg.get("split_test_scores", [])
+                        n = msg.get("n_splits", 0)
+                        fold_metrics = msg.get("fold_metrics", [])
+                        # Format scores
+                        mean_txt = f"mean={mean_score:.4f}" if mean_score is not None else ""
+                        std_txt = f"std={std_score:.4f}" if std_score is not None else ""
+                        splits_txt = ", ".join([f"fold{i+1}={s:.4f}" for i, s in enumerate(split_scores)])
+                        # Format detailed per-fold metrics if present
+                        detailed_txt = ""
+                        if fold_metrics:
+                            detailed_lines = []
+                            for i, m in enumerate(fold_metrics):
+                                metrics_str = ", ".join([f"{k}={v:.4f}" for k, v in m.items()])
+                                detailed_lines.append(f"Fold {i+1}: {metrics_str}")
+                            detailed_txt = "\n" + "\n".join(detailed_lines)
+                        status_text = f"CV Results: {mean_txt}, {std_txt}, {splits_txt}{detailed_txt}"
+                        status.markdown(status_text.replace("\n", "  "))
+                        logs.insert(0, f"[cv_results] {status_text}")
+                        logs_box.text_area("Training logs (most recent first)", value="\n".join(logs), height=260)
                     elif t == "done":
                         path = msg.get("path", "")
                         progress_bar.progress(100)
