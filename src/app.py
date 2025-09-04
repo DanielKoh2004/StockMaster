@@ -19,7 +19,11 @@ import time
 from src.data import download_ticker
 from src.labeling import create_class_labels, create_reg_target
 from src.features import add_basic_features
-from src.model import train_xgb_classifier, train_xgb_regressor, train_ann_classifier, train_ann_regressor, load_model, predict_with_model
+from src.model import (
+    train_xgb_classifier, train_xgb_regressor,
+    train_ann_classifier, train_ann_regressor,
+    load_model, predict_with_model, predict_proba_with_model
+)
 from src.model import train_nb_classifier, train_svm_classifier, train_svm_regressor
 def load_local_combined():
     """Load historical_all.csv into memory."""
@@ -46,12 +50,17 @@ def get_ticker_data(ticker, start="2018-01-01", end=None):
 
     return df
 def build_asset_map_from_combined():
-    """Dynamically build asset groups (stocks, metals, crypto) from combined CSV, with names."""
+    """Dynamically build asset groups (stocks, metals, crypto) from combined CSV, with names.
+
+    Excludes certain ambiguous/raw tickers that shouldn't be shown as assets (e.g., BTC spot proxy, GC).
+    """
     df = load_local_combined()
     if df is None or df.empty or "Ticker" not in df.columns:
         return {"Stocks": {}, "Metals": {}, "Cryptocurrencies": {}}
 
-    tickers = sorted(df["Ticker"].unique())
+    # Exclude ambiguous/raw symbols from UI lists
+    EXCLUDE_TICKERS = {"BTC", "GC"}
+    tickers = [t for t in sorted(df["Ticker"].unique()) if t not in EXCLUDE_TICKERS]
     asset_map = {"Stocks": {}, "Metals": {}, "Cryptocurrencies": {}}
 
     for tk in tickers:
@@ -222,6 +231,110 @@ def fmt(v):
     except Exception:
         return v
 
+def load_model_metadata(model_path: Path):
+    try:
+        meta_path = Path(model_path).with_suffix(Path(model_path).suffix + ".meta.json")
+        if meta_path.exists():
+            import json
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
+
+def ensure_reports_dir():
+    base = Path(__file__).resolve().parents[1]
+    rpt = base / "reports"
+    rpt.mkdir(exist_ok=True)
+    return rpt
+
+def render_model_card(model, model_path: Path, meta: dict):
+    with st.expander("Model card", expanded=False):
+        cols = st.columns(3)
+        cols[0].markdown(f"**File**: {model_path.name if model_path else '—'}")
+        if meta:
+            cols[1].markdown(f"**Best CV score**: {meta.get('best_score', '—'):.4f}" if meta.get('best_score') is not None else "**Best CV score**: —")
+            cols[2].markdown(f"**Folds**: {meta.get('n_splits','—')}")
+            c2 = st.columns(3)
+            c2[0].markdown(f"**Train rows**: {meta.get('train_rows','—')}")
+            c2[1].markdown(f"**Features**: {meta.get('n_features','—')}")
+            c2[2].markdown(f"**Train time**: {int(meta.get('duration_sec',0))}s")
+            st.markdown(f"**Window**: {meta.get('date_start','—')} → {meta.get('date_end','—')}")
+            bp = meta.get('best_params')
+            if bp:
+                st.markdown("**Best params**")
+                st.json(bp)
+        # Fallback to estimator params
+        try:
+            params = model.get_params()
+            # filter common estimator params
+            keys = [k for k in params.keys() if any(k.startswith(p) for p in ('xgb__','ann__','svc__','svr__','nb__'))]
+            subset = {k: params[k] for k in keys}
+            if subset:
+                st.markdown("**Estimator params**")
+                st.json(subset)
+        except Exception:
+            pass
+
+def render_confusion_matrix(y_true, y_pred, labels=(-1,0,1), title="Confusion Matrix"):
+    try:
+        from sklearn.metrics import confusion_matrix
+        import plotly.figure_factory as ff
+        cm = confusion_matrix(y_true, y_pred, labels=list(labels))
+        z = cm.astype(int)
+        z_text = [[str(v) for v in row] for row in z]
+        fig = ff.create_annotated_heatmap(z, x=[str(l) for l in labels], y=[str(l) for l in labels], colorscale='Blues', showscale=True, annotation_text=z_text)
+        fig.update_layout(title=title, xaxis_title="Predicted", yaxis_title="Actual", height=320)
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.info(f"Confusion matrix unavailable: {e}")
+
+def threshold_predict_from_proba(probs, threshold=0.5):
+    """Given probs shaped (n,3) in order [-1,0,1], return labels using threshold: if P(1)>=t -> 1; elif P(-1)>=t -> -1; else 0."""
+    if probs is None:
+        return None
+    import numpy as np
+    p_down = probs[:,0]
+    p_stable = probs[:,1]
+    p_up = probs[:,2]
+    preds = np.where(p_up >= threshold, 1, np.where(p_down >= threshold, -1, 0))
+    return preds
+
+def compute_macro_aucs(y_true, probs):
+    try:
+        import numpy as np
+        from sklearn.preprocessing import label_binarize
+        from sklearn.metrics import roc_auc_score, average_precision_score
+        classes = [-1,0,1]
+        Y = label_binarize(y_true, classes=classes)
+        # probs shape (n,3) order [-1,0,1]
+        roc_auc = roc_auc_score(Y, probs, average='macro', multi_class='ovr')
+        pr_auc = average_precision_score(Y, probs, average='macro')
+        return float(roc_auc), float(pr_auc)
+    except Exception:
+        return None, None
+
+def render_fold_timeline(fold_ranges):
+    if not fold_ranges:
+        return
+    try:
+        import pandas as pd
+        import plotly.express as px
+        data = []
+        for i, fr in enumerate(fold_ranges, start=1):
+            data.append({"Fold": f"Train {i}", "Start": fr['train'][0], "Finish": fr['train'][1], "Type": "Train"})
+            data.append({"Fold": f"Test {i}", "Start": fr['test'][0], "Finish": fr['test'][1], "Type": "Test"})
+        df = pd.DataFrame(data)
+        fig = px.timeline(df, x_start="Start", x_end="Finish", y="Fold", color="Type")
+        fig.update_layout(height=220, margin=dict(t=20,b=10,l=10,r=10))
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception:
+        # Fallback: simple text list
+        lines = []
+        for i, fr in enumerate(fold_ranges, start=1):
+            lines.append(f"Fold {i} — Train: {fr['train'][0]} → {fr['train'][1]} | Test: {fr['test'][0]} → {fr['test'][1]}")
+        st.code("\n".join(lines))
+
 def safe_latest_model(prefix, ticker, horizon: int = None):
     """
     Find latest model file for ticker and optional horizon.
@@ -382,6 +495,7 @@ st.markdown("""
 menu_items = {
     "Home": "🏠",
     "Predictor": "📈",
+    "Compare": "📊",
     "Summary": "📊",
     "Train": "⚙️",
     "Assets": "💹",
@@ -408,6 +522,24 @@ PAGE = st.session_state.page
 # Apply fade-in class wrapper for the whole content below navbar
 st.markdown('<div class="fade-in">', unsafe_allow_html=True)
 
+def render_data_health_panel():
+    df = load_local_combined()
+    if df is None or df.empty:
+        st.info("Data Health: historical_all.csv is missing or empty in data/.")
+        return
+    try:
+        total_rows = len(df)
+        tickers = df['Ticker'].nunique() if 'Ticker' in df.columns else None
+        last_date = pd.to_datetime(df['Date']).max() if 'Date' in df.columns else None
+        with st.expander("Data Health", expanded=True):
+            cols = st.columns(3)
+            cols[0].metric("Rows", f"{total_rows:,}")
+            cols[1].metric("Tickers", f"{tickers}")
+            cols[2].metric("Last date", str(last_date.date()) if last_date is not None else "—")
+            st.caption("Source: Yahoo Finance (pre-collected). Use Train/Evaluate with these cached files.")
+    except Exception:
+        pass
+
 
 
 # ---------------------------
@@ -422,8 +554,13 @@ if PAGE == "Home":
     """)
     st.markdown("---")
 
-    # Model selection for home page
-    home_model_type = st.selectbox("Model", ["XGBoost", "ANN", "SVM"], key="home_model_type")
+    # Brief dataset status snapshot
+    render_data_health_panel()
+
+    # Model selection for home page (default to SVM)
+    home_model_options = ["XGBoost", "ANN", "SVM"]
+    home_model_default_index = home_model_options.index("SVM") if "SVM" in home_model_options else 0
+    home_model_type = st.selectbox("Model", home_model_options, index=home_model_default_index, key="home_model_type")
 
     # Define assets (reuse same lists you used elsewhere)
     asset_map = build_asset_map_from_combined()
@@ -673,18 +810,29 @@ if PAGE == "Predictor":
     asset_map = build_asset_map_from_combined()
 
     # Model selection for prediction
-    pred_model_type = st.selectbox("Model", ["XGBoost", "ANN", "Naive Bayes", "SVM"], key="pred_model_type")
+    # Model selection for prediction (default to SVM)
+    pred_model_options = ["XGBoost", "ANN", "Naive Bayes", "SVM"]
+    pred_model_default_index = pred_model_options.index("SVM") if "SVM" in pred_model_options else 0
+    pred_model_type = st.selectbox("Model", pred_model_options, index=pred_model_default_index, key="pred_model_type")
 
     # Step 1: Choose asset type
-    asset_type = st.selectbox("Asset type", list(asset_map.keys()), key="pred_asset_type_select")
+    # Default asset type to Stocks when available
+    asset_types = list(asset_map.keys())
+    asset_type_default_index = asset_types.index("Stocks") if "Stocks" in asset_types else 0
+    asset_type = st.selectbox("Asset type", asset_types, index=asset_type_default_index, key="pred_asset_type_select")
 
     # Step 2: Choose ticker(s) only from available list
     available = asset_map[asset_type]
+    # Default tickers for Stocks: BAC, NKE, TSLA, CRM, INTC (fallback to first 2 if not applicable)
+    preferred_stock_defaults = ["BAC", "NKE", "TSLA", "CRM", "INTC"]
+    default_tickers = [t for t in preferred_stock_defaults if t in available.keys()] if asset_type == "Stocks" else []
+    if not default_tickers:
+        default_tickers = list(available.keys())[:2]
     tickers = st.multiselect(
         "Choose tickers",
         options=list(available.keys()),
         format_func=lambda x: f"{x} — {available[x]}",
-        default=list(available.keys())[:2],  # first 2 as default
+        default=default_tickers,
         key="pred_tickers_select"
     )
 
@@ -809,6 +957,13 @@ if PAGE == "Predictor":
             with top_right:
                 if model_path:
                     st.success("Model found")
+                    # Model card with metadata and params
+                    meta = load_model_metadata(model_path)
+                    try:
+                        model_loaded = load_model(model_path)
+                    except Exception:
+                        model_loaded = None
+                    render_model_card(model_loaded, model_path, meta)
                 else:
                     st.info("No model")
 
@@ -834,6 +989,47 @@ if PAGE == "Predictor":
                 if np.issubdtype(df_disp[c].dtype, np.number):
                     df_disp[c] = df_disp[c].map(lambda x: fmt(x))
             st.dataframe(df_disp, use_container_width=True, height=200)
+
+            # --- Classification analysis with threshold, metrics, ROC/PR, misclassifications
+            if mode.startswith("Class") and model_path:
+                try:
+                    model = load_model(model_path)
+                    features = [c for c in df.columns if c not in {'Date','next_close','ret_next','label'} and np.issubdtype(df[c].dtype, np.number)]
+                    probs = predict_proba_with_model(model, df, features)
+                    if probs is not None and 'label' in df.columns:
+                        st.markdown("---")
+                        st.subheader("Classification analysis")
+                        thr = st.slider("Decision threshold (Up/Down)", 0.3, 0.8, 0.5, 0.01, key=f"thr_{tk}")
+                        preds_thr = threshold_predict_from_proba(probs, threshold=thr)
+                        y_true = df['label']
+                        # Metrics
+                        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+                        acc = accuracy_score(y_true, preds_thr)
+                        prec = precision_score(y_true, preds_thr, average='weighted', zero_division=0)
+                        rec = recall_score(y_true, preds_thr, average='weighted', zero_division=0)
+                        f1 = f1_score(y_true, preds_thr, average='weighted', zero_division=0)
+                        mcols2 = st.columns(4)
+                        mcols2[0].metric("Accuracy", f"{acc:.3f}")
+                        mcols2[1].metric("Precision(w)", f"{prec:.3f}")
+                        mcols2[2].metric("Recall(w)", f"{rec:.3f}")
+                        mcols2[3].metric("F1(w)", f"{f1:.3f}")
+                        # Confusion matrix
+                        render_confusion_matrix(y_true, preds_thr, title="Confusion (thresholded)")
+                        # ROC/PR AUC
+                        roc_auc, pr_auc = compute_macro_aucs(y_true, probs)
+                        st.caption(f"Macro ROC-AUC: {roc_auc if roc_auc is not None else 'NA'} | Macro PR-AUC: {pr_auc if pr_auc is not None else 'NA'}")
+                        # Misclassifications table
+                        wrong_idx = (preds_thr != y_true).to_numpy().nonzero()[0]
+                        if len(wrong_idx) > 0:
+                            last_n = 10
+                            sel = wrong_idx[-last_n:]
+                            cols_show = ['Date','Close','label'] + [c for c in ['ma5','ma10','rsi14','macd','bb_high','bb_low'] if c in df.columns]
+                            mis = df.iloc[sel][cols_show].copy()
+                            mis['pred'] = preds_thr[sel]
+                            st.markdown("#### Recent misclassifications")
+                            st.dataframe(mis, use_container_width=True)
+                except Exception as e:
+                    st.info(f"Analysis unavailable: {e}")
 # ---------------------------
 # TRAIN (unique keys)
 # ---------------------------
@@ -843,19 +1039,26 @@ if PAGE == "Train":
 
     # train type
     type_sel = st.radio("Train type", ("Classification (direction)", "Regression (price)"), key="train_type")
-    # model type
-    train_model_type = st.selectbox("Model", ["XGBoost", "ANN", "Naive Bayes", "SVM"], key="train_model_type")
+    # model type default to SVM
+    train_model_options = ["XGBoost", "ANN", "Naive Bayes", "SVM"]
+    train_model_default_index = train_model_options.index("SVM") if "SVM" in train_model_options else 0
+    train_model_type = st.selectbox("Model", train_model_options, index=train_model_default_index, key="train_model_type")
 
     # asset list
     asset_map = build_asset_map_from_combined()
     asset_classes = list(asset_map.keys())
-    asset_sel = st.selectbox("Asset class", asset_classes, key="train_asset")
+    asset_default_index = asset_classes.index("Stocks") if "Stocks" in asset_classes else 0
+    asset_sel = st.selectbox("Asset class", asset_classes, index=asset_default_index, key="train_asset")
 
+    # preferred default tickers when in Stocks
+    preferred_stock_defaults = ["BAC", "NKE", "TSLA", "CRM", "INTC"]
+    available_train = list(asset_map[asset_sel].keys())
+    default_train_tickers = [t for t in preferred_stock_defaults if t in available_train] if asset_sel == "Stocks" else available_train[:2]
     tickers = st.multiselect(
         "Select tickers to train",
-        options=list(asset_map[asset_sel].keys()),
+        options=available_train,
         format_func=lambda x: f"{x} — {asset_map[asset_sel][x]}",
-        default=list(asset_map[asset_sel].keys())[:2],
+        default=default_train_tickers,
         key="train_tickers"
     )
 
@@ -870,7 +1073,13 @@ if PAGE == "Train":
 
     train_btn = st.button("Train now", key="train_run")
 
+    # Keep a per-run summary we can export
+    if "train_results" not in st.session_state:
+        st.session_state.train_results = []
+
     if train_btn:
+        # reset summary for this run
+        st.session_state.train_results = []
         if not tickers:
             st.warning("Enter tickers.")
         else:
@@ -878,6 +1087,7 @@ if PAGE == "Train":
             progress_bar = st.progress(0)
             status = st.empty()
             logs_box = st.empty()
+            fold_timeline_slot = st.empty()
             # use a list (mutable) so progress_cb can mutate without nonlocal
             logs = []
 
@@ -918,6 +1128,7 @@ if PAGE == "Train":
                         split_scores = msg.get("split_test_scores", [])
                         n = msg.get("n_splits", 0)
                         fold_metrics = msg.get("fold_metrics", [])
+                        fold_ranges = msg.get("fold_ranges", [])
                         # Format scores
                         mean_txt = f"mean={mean_score:.4f}" if mean_score is not None else ""
                         std_txt = f"std={std_score:.4f}" if std_score is not None else ""
@@ -934,12 +1145,53 @@ if PAGE == "Train":
                         status.markdown(status_text.replace("\n", "  "))
                         logs.insert(0, f"[cv_results] {status_text}")
                         logs_box.text_area("Training logs (most recent first)", value="\n".join(logs), height=260)
+                        # Render fold ranges timeline if provided
+                        if fold_ranges:
+                            with fold_timeline_slot:
+                                st.caption("Train/Test fold ranges")
+                                render_fold_timeline(fold_ranges)
                     elif t == "done":
                         path = msg.get("path", "")
                         progress_bar.progress(100)
                         status.markdown(f"Saved model: {Path(path).name}")
                         logs.insert(0, f"[done] Saved model: {path}")
                         logs_box.text_area("Training logs (most recent first)", value="\n".join(logs), height=260)
+                        # Append to run summary using metadata
+                        try:
+                            p = Path(path)
+                            meta = load_model_metadata(p)
+                            fname = p.name
+                            # infer
+                            model_type = (
+                                "XGBoost" if fname.startswith("xgb_") else
+                                "ANN" if fname.startswith("ann_") else
+                                "Naive Bayes" if fname.startswith("nb_") else
+                                "SVM" if fname.startswith("svm_") else "?"
+                            )
+                            task = "Classification" if "_class_" in fname else ("Regression" if "_reg_" in fname else "?")
+                            # parse ticker and horizon from name like xgb_class_AAPL_h5.joblib
+                            ticker_part = fname.split("_")[-2] if "_" in fname else "?"
+                            import re
+                            m = re.search(r"_h(\d+)", fname)
+                            horizon_val = int(m.group(1)) if m else None
+                            row = {
+                                "file": fname,
+                                "model": model_type,
+                                "task": task,
+                                "ticker": ticker_part,
+                                "horizon": horizon_val,
+                                "best_cv": meta.get("best_score") if meta else None,
+                                "folds": meta.get("n_splits") if meta else None,
+                                "train_rows": meta.get("train_rows") if meta else None,
+                                "n_features": meta.get("n_features") if meta else None,
+                                "train_time_sec": meta.get("duration_sec") if meta else None,
+                                "date_start": meta.get("date_start") if meta else None,
+                                "date_end": meta.get("date_end") if meta else None,
+                                "path": str(p)
+                            }
+                            st.session_state.train_results.append(row)
+                        except Exception:
+                            pass
                 except Exception as e:
                     logs.insert(0, f"[callback error] {e}")
                     logs_box.text_area("Training logs (most recent first)", value="\n".join(logs), height=260)
@@ -1058,6 +1310,26 @@ if PAGE == "Train":
                         # finalize UI
             progress_bar.progress(100)
             status.markdown("All training completed.")
+            # Show run summary with export option
+            if st.session_state.train_results:
+                st.markdown("---")
+                st.subheader("Run summary")
+                import pandas as _pd
+                df_sum = _pd.DataFrame(st.session_state.train_results)
+                st.dataframe(df_sum)
+                colx, coly = st.columns([1,1])
+                with colx:
+                    if st.button("Export summary CSV", key="train_export_csv"):
+                        rpt = ensure_reports_dir()
+                        ts = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
+                        out_path = rpt / f"train_summary_{ts}.csv"
+                        try:
+                            df_sum.to_csv(out_path, index=False)
+                            st.success(f"Saved: {out_path}")
+                        except Exception as e:
+                            st.error(f"Failed to save: {e}")
+                with coly:
+                    st.download_button("Download CSV", data=df_sum.to_csv(index=False), file_name="train_summary.csv", mime="text/csv", key="train_download_csv")
     # --- Holdout Evaluation Section ---
     st.markdown("---")
     st.header("Evaluate Model on Holdout Data (Unseen)")
@@ -1130,6 +1402,137 @@ if PAGE == "Train":
                         st.write(f'RMSE: {rmse:.4f}')
                         st.write(f'R2: {r2:.4f}')
 
+    # --- One-click Batch Evaluation ---
+    st.markdown("---")
+    st.header("One-click Batch Evaluation")
+    st.markdown("Evaluate many saved models on a chosen holdout window and export a consolidated CSV.")
+    import re, os
+    model_files = [f for f in os.listdir(model_dir) if f.endswith('.joblib')]
+    if not model_files:
+        st.info("No saved models found.")
+    else:
+        # Parse basic info from filenames like xgb_class_AAPL_h5.joblib
+        def parse_model_name(fname: str):
+            m = re.match(r"(xgb|ann|svm|nb)_(class|reg)_([^_]+)_h(\d+)\.joblib$", fname)
+            if not m:
+                return None
+            family, task, ticker, h = m.groups()
+            model_map = {"xgb":"XGBoost","ann":"ANN","svm":"SVM","nb":"Naive Bayes"}
+            return {
+                "file": fname,
+                "family": family,
+                "model": model_map.get(family, family),
+                "task": "Classification" if task == "class" else "Regression",
+                "ticker": ticker,
+                "horizon": int(h)
+            }
+
+        parsed = [p for p in (parse_model_name(f) for f in model_files) if p]
+        if not parsed:
+            st.info("No parsable model filenames. Expected pattern: xgb_class_TICKER_hN.joblib")
+        else:
+            df_models = pd.DataFrame(parsed)
+            task_sel = st.selectbox("Task", sorted(df_models['task'].unique().tolist()), key="batch_task")
+            eligible = df_models[df_models['task'] == task_sel]
+            tickers_opts = sorted(eligible['ticker'].unique().tolist())
+            tickers_sel = st.multiselect("Tickers to evaluate", tickers_opts, default=tickers_opts[:5], key="batch_tickers")
+            horizons_opts = sorted(eligible['horizon'].unique().tolist())
+            horizon_sel = st.selectbox("Horizon", horizons_opts, index=0, key="batch_h")
+            test_pct = st.slider('Holdout set size (percent)', 10, 50, 20, key='batch_test_size')
+            eval_start = st.text_input("Start date (optional)", "2018-01-01", key="batch_start")
+            eval_end = st.text_input("End date (optional)", "", key="batch_end")
+            go = st.button("Run batch evaluation", key="batch_go")
+
+            if go:
+                rows = []
+                for _, row in eligible[eligible['ticker'].isin(tickers_sel) & (eligible['horizon'] == horizon_sel)].iterrows():
+                    fname = row['file']
+                    ticker = row['ticker']
+                    horizon = int(row['horizon'])
+                    task = row['task']
+                    model_type = row['model']
+                    mpath = MODELS_DIR / fname
+                    try:
+                        df_raw = get_ticker_data(ticker, start=eval_start or None, end=eval_end or None)
+                        if df_raw is None or df_raw.empty:
+                            rows.append({"file": fname, "ticker": ticker, "result": "no-data"})
+                            continue
+                        df_raw = prepare_df_numeric(df_raw)
+                        if task == "Classification":
+                            df = create_class_labels(df_raw, horizon=horizon)
+                            df = add_basic_features(df)
+                            if df is None or df.empty or 'label' not in df.columns:
+                                rows.append({"file": fname, "ticker": ticker, "result": "no-labels"})
+                                continue
+                            # split
+                            k = max(1, int(len(df) * test_pct / 100))
+                            train_df = df.iloc[:-k]
+                            hold_df = df.iloc[-k:]
+                            features = [c for c in df.columns if c not in {'Date','next_close','ret_next','label'} and np.issubdtype(df[c].dtype, np.number)]
+                            model = load_model(mpath)
+                            Xh = hold_df[features]
+                            yh = hold_df['label']
+                            preds = model.predict(Xh)
+                            # If encoded as 0/1/2, remap to -1/0/1
+                            try:
+                                if preds.min() >= 0:
+                                    preds = preds - 1
+                            except Exception:
+                                pass
+                            from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+                            acc = accuracy_score(yh, preds)
+                            prec = precision_score(yh, preds, average='weighted', zero_division=0)
+                            rec = recall_score(yh, preds, average='weighted', zero_division=0)
+                            f1 = f1_score(yh, preds, average='weighted', zero_division=0)
+                            rows.append({
+                                "file": fname, "model": model_type, "task": task, "ticker": ticker, "horizon": horizon,
+                                "Accuracy": acc, "Precision": prec, "Recall": rec, "F1": f1,
+                                "rows_train": len(train_df), "rows_holdout": len(hold_df)
+                            })
+                        else:  # Regression
+                            df = create_reg_target(df_raw, horizon=horizon)
+                            df = add_basic_features(df)
+                            if df is None or df.empty or 'next_close' not in df.columns:
+                                rows.append({"file": fname, "ticker": ticker, "result": "no-target"})
+                                continue
+                            k = max(1, int(len(df) * test_pct / 100))
+                            train_df = df.iloc[:-k]
+                            hold_df = df.iloc[-k:]
+                            features = [c for c in df.columns if c not in {'Date','next_close'} and np.issubdtype(df[c].dtype, np.number)]
+                            model = load_model(mpath)
+                            Xh = hold_df[features]
+                            yh = hold_df['next_close']
+                            preds = model.predict(Xh)
+                            from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+                            mae = mean_absolute_error(yh, preds)
+                            rmse = float(np.sqrt(mean_squared_error(yh, preds)))
+                            r2 = r2_score(yh, preds)
+                            rows.append({
+                                "file": fname, "model": model_type, "task": task, "ticker": ticker, "horizon": horizon,
+                                "MAE": mae, "RMSE": rmse, "R2": r2,
+                                "rows_train": len(train_df), "rows_holdout": len(hold_df)
+                            })
+                    except Exception as e:
+                        rows.append({"file": fname, "ticker": ticker, "result": f"error: {e}"})
+
+                if rows:
+                    df_out = pd.DataFrame(rows)
+                    st.subheader("Batch results")
+                    st.dataframe(df_out)
+                    c1, c2 = st.columns([1,1])
+                    with c1:
+                        if st.button("Export to reports/", key="batch_export"):
+                            try:
+                                rpt = ensure_reports_dir()
+                                ts = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
+                                outp = rpt / f"batch_eval_{task_sel.lower()}_{ts}.csv"
+                                df_out.to_csv(outp, index=False)
+                                st.success(f"Saved: {outp}")
+                            except Exception as e:
+                                st.error(f"Save failed: {e}")
+                    with c2:
+                        st.download_button("Download CSV", data=df_out.to_csv(index=False), file_name="batch_eval.csv", mime="text/csv", key="batch_download")
+
 # ---------------------------
 # ASSETS (unique key for choice)
 # ---------------------------
@@ -1154,14 +1557,18 @@ if PAGE == "Assets":
         "SVM": "SVM: Support Vector Machine, effective for high-dimensional spaces.",
         "Naive Bayes (classification only)": "Naive Bayes: classification only, best for simple patterns."
     }
+    # Default to SVM on Assets page
+    assets_model_default_index = model_options.index("SVM") if "SVM" in model_options else 0
     assets_model_type = st.selectbox(
         "Model",
         model_options,
+        index=assets_model_default_index,
         key="assets_model_type"
     )
     st.markdown(f"<span style='font-size:0.98rem;color:#888'>{model_descriptions[assets_model_type]}</span>", unsafe_allow_html=True)
 
-    asset_choice = st.selectbox("Which assets to show", ("Stocks","Metals","Cryptocurrencies","All"), key="assets_choice")
+    # Default asset view to Stocks
+    asset_choice = st.selectbox("Which assets to show", ("Stocks","Metals","Cryptocurrencies","All"), index=0, key="assets_choice")
 
     if asset_choice == "All":
         show_list = sum([list(v.keys()) for v in asset_map.values()], [])
@@ -1344,6 +1751,153 @@ if PAGE == "Models":
     else:
         for p in models:
             st.write(p.name, "| size KB:", int(p.stat().st_size/1024), "| modified:", time.ctime(p.stat().st_mtime))
+
+# ---------------------------
+# COMPARE (multi-ticker, multi-model classification)
+# ---------------------------
+if PAGE == "Compare":
+    st.title("Compare Models — Classification")
+    st.markdown("Pick tickers, horizon and models. We compute Accuracy, Precision, Recall, and F1, plus confusion matrices per ticker.")
+
+    asset_map = build_asset_map_from_combined()
+    # Inputs
+    asset_type_list = list(asset_map.keys())
+    asset_default_index = asset_type_list.index("Stocks") if "Stocks" in asset_type_list else 0
+    asset_type = st.selectbox("Asset type", asset_type_list, index=asset_default_index, key="cmp_asset_type")
+
+    available = asset_map[asset_type]
+    preferred_stock_defaults = ["BAC", "NKE", "TSLA", "CRM", "INTC"]
+    default_tickers = [t for t in preferred_stock_defaults if t in available.keys()] if asset_type == "Stocks" else list(available.keys())[:2]
+    tickers = st.multiselect(
+        "Choose tickers",
+        options=list(available.keys()),
+        format_func=lambda x: f"{x} — {available[x]}",
+        default=default_tickers,
+        key="cmp_tickers"
+    )
+
+    horizon_map = {"1 day": 1, "1 week (~5 trading days)": 5, "1 month (~21 trading days)": 21}
+    horizon_choice = st.selectbox("Prediction horizon", list(horizon_map.keys()), index=0, key="cmp_horizon")
+    horizon = horizon_map[horizon_choice]
+
+    model_choices = ["XGBoost", "ANN", "SVM", "Naive Bayes"]
+    default_models = ["SVM", "XGBoost"]
+    models_sel = st.multiselect("Models to compare", model_choices, default=default_models, key="cmp_models")
+
+    start = st.text_input("Start date (YYYY-MM-DD)", "2018-01-01", key="cmp_start")
+    end = st.text_input("End date (YYYY-MM-DD or empty)", "", key="cmp_end")
+    btn = st.button("Run comparison", key="cmp_run")
+
+    if btn:
+        if not tickers:
+            st.warning("Select at least one ticker.")
+        elif not models_sel:
+            st.warning("Select at least one model.")
+        else:
+            import pandas as pd
+            import numpy as np
+            from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+            import plotly.figure_factory as ff
+
+            rows = []
+            for tk in tickers:
+                # Load data
+                df_raw = get_ticker_data(tk, start=start, end=end if end else None)
+                if df_raw is None or df_raw.empty:
+                    st.error(f"No data for {tk}")
+                    continue
+                df_raw = prepare_df_numeric(df_raw)
+                df = create_class_labels(df_raw, horizon=horizon)
+                df = add_basic_features(df)
+                if df is None or df.empty or 'label' not in df.columns:
+                    st.error(f"No valid classification data for {tk}")
+                    continue
+                features = [c for c in df.columns if c not in {'Date','next_close','ret_next','label'} and np.issubdtype(df[c].dtype, np.number)]
+                y_true = df['label']
+
+                # Prepare confusion matrix chart data container
+                confmats = {}
+
+                for mtype in models_sel:
+                    if mtype == "XGBoost":
+                        prefix = "xgb_class_"
+                    elif mtype == "ANN":
+                        prefix = "ann_class_"
+                    elif mtype == "SVM":
+                        prefix = "svm_class_"
+                    elif mtype == "Naive Bayes":
+                        prefix = "nb_class_"
+                    else:
+                        continue
+                    model_path = safe_latest_model(prefix, tk, horizon=horizon)
+                    if not model_path:
+                        rows.append({"Ticker": tk, "Model": mtype, "Accuracy": None, "Precision": None, "Recall": None, "F1": None, "Info": "No model file"})
+                        continue
+                    try:
+                        model = load_model(model_path)
+                        preds = predict_with_model(model, df, features, is_classifier=True)
+                        acc = accuracy_score(y_true, preds)
+                        prec = precision_score(y_true, preds, average='weighted', zero_division=0)
+                        rec = recall_score(y_true, preds, average='weighted', zero_division=0)
+                        f1 = f1_score(y_true, preds, average='weighted', zero_division=0)
+                        rows.append({"Ticker": tk, "Model": mtype, "Accuracy": acc, "Precision": prec, "Recall": rec, "F1": f1, "Info": ""})
+
+                        # Confusion matrix per ticker per model
+                        labels = sorted(list(set(y_true) | set(preds)))
+                        cm = confusion_matrix(y_true, preds, labels=labels)
+                        confmats[mtype] = (labels, cm)
+                    except Exception as e:
+                        rows.append({"Ticker": tk, "Model": mtype, "Accuracy": None, "Precision": None, "Recall": None, "F1": None, "Info": f"Error: {str(e)}"})
+
+                # Render confusion matrices for this ticker
+                if confmats:
+                    st.markdown(f"### {tk} — Confusion Matrices")
+                    cols = st.columns(max(1, min(3, len(confmats))))
+                    i = 0
+                    for mtype, (labels, cm) in confmats.items():
+                        z = cm.astype(int)
+                        z_text = [[str(v) for v in row] for row in z]
+                        fig = ff.create_annotated_heatmap(z, x=[str(l) for l in labels], y=[str(l) for l in labels], colorscale='Blues', showscale=True, annotation_text=z_text)
+                        fig.update_layout(title=f"{mtype}", xaxis_title="Predicted", yaxis_title="Actual")
+                        with cols[i % len(cols)]:
+                            st.plotly_chart(fig, use_container_width=True)
+                        i += 1
+
+            # Results table
+            st.markdown("---")
+            st.subheader("Metrics Table")
+            if rows:
+                dfm = pd.DataFrame(rows)
+                # Sort by Ticker then F1 desc
+                with pd.option_context('display.precision', 4):
+                    st.dataframe(dfm.sort_values(["Ticker", "F1"], ascending=[True, False]).set_index(["Ticker","Model"]))
+                # Aggregate per model across tickers
+                st.markdown("#### Average across selected tickers")
+                agg = (
+                    dfm.dropna(subset=["Accuracy"]) 
+                    .groupby("Model")[ ["Accuracy", "Precision", "Recall", "F1"] ]
+                    .mean()
+                    .sort_values("F1", ascending=False)
+                )
+                st.dataframe(agg)
+                # Export options
+                col_a, col_b = st.columns([1,1])
+                with col_a:
+                    if st.button("Export results to reports/", key="cmp_export"):
+                        try:
+                            rpt = ensure_reports_dir()
+                            ts = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
+                            out1 = rpt / f"compare_rows_{ts}.csv"
+                            out2 = rpt / f"compare_agg_{ts}.csv"
+                            dfm.to_csv(out1, index=False)
+                            agg.to_csv(out2)
+                            st.success(f"Saved: {out1.name}, {out2.name} in {rpt}")
+                        except Exception as e:
+                            st.error(f"Save failed: {e}")
+                with col_b:
+                    st.download_button("Download metrics CSV", data=dfm.to_csv(index=False), file_name="compare_metrics.csv", mime="text/csv", key="cmp_download")
+            else:
+                st.info("No results generated.")
 
 # ---------------------------
 # SUMMARY PAGE (unique key)

@@ -1,4 +1,6 @@
 from pathlib import Path
+import json
+from datetime import datetime
 import joblib
 import numpy as np
 from sklearn.pipeline import Pipeline
@@ -7,6 +9,15 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.naive_bayes import GaussianNB
 from sklearn.svm import SVC, SVR
+def _save_metadata(save_path: Path, meta: dict):
+    try:
+        meta_path = save_path.with_suffix(save_path.suffix + ".meta.json")
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            json.dump(meta, f, indent=2, default=str)
+    except Exception:
+        pass
+
+
 def train_nb_classifier(df, features, label_col='label', save_name='nb_class.joblib', n_splits=5, progress_callback=None):
     """
     Train Naive Bayes classifier with TimeSeriesSplit.
@@ -25,7 +36,9 @@ def train_nb_classifier(df, features, label_col='label', save_name='nb_class.job
         'nb__var_smoothing': [1e-9]  # Reduced grid for speed
     }
     gs = GridSearchCV(pipe, param_grid, cv=tscv, scoring='f1_macro', n_jobs=1, verbose=1)
+    t0 = datetime.utcnow()
     gs.fit(X, y_m)
+    t1 = datetime.utcnow()
     best_model = gs.best_estimator_
     if progress_callback:
         from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
@@ -35,9 +48,20 @@ def train_nb_classifier(df, features, label_col='label', save_name='nb_class.job
         split_scores = [gs.cv_results_[f'split{i}_test_score'][best_idx] for i in range(n_splits)]
         tscv = TimeSeriesSplit(n_splits=n_splits)
         fold_metrics = []
+        fold_ranges = []
         for i, (train_idx, test_idx) in enumerate(tscv.split(X)):
             X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
             y_train, y_test = y_m.iloc[train_idx], y_m.iloc[test_idx]
+            # capture fold ranges if Date column exists in df
+            if 'Date' in df.columns:
+                train_start = df['Date'].iloc[train_idx[0]]
+                train_end = df['Date'].iloc[train_idx[-1]]
+                test_start = df['Date'].iloc[test_idx[0]]
+                test_end = df['Date'].iloc[test_idx[-1]]
+                fold_ranges.append({
+                    "train": [str(train_start), str(train_end)],
+                    "test": [str(test_start), str(test_end)]
+                })
             model = best_model.fit(X_train, y_train)
             preds = model.predict(X_test)
             preds_orig = preds - 1
@@ -54,11 +78,30 @@ def train_nb_classifier(df, features, label_col='label', save_name='nb_class.job
             "std_test_score": float(std_test_scores[best_idx]),
             "split_test_scores": [float(s) for s in split_scores],
             "fold_metrics": fold_metrics,
-            "n_splits": n_splits
+            "n_splits": n_splits,
+            "fold_ranges": fold_ranges
         })
         progress_callback({"type": "done", "path": str(save_name), "best_params": gs.best_params_, "best_score": gs.best_score_})
     out = MODELS_DIR / save_name
     joblib.dump(best_model, out)
+    # Save metadata
+    date_start = str(df['Date'].min()) if 'Date' in df.columns else None
+    date_end = str(df['Date'].max()) if 'Date' in df.columns else None
+    meta = {
+        "model_file": str(out.name),
+        "model_type": "NaiveBayesClassifier",
+        "n_splits": n_splits,
+        "best_params": gs.best_params_,
+        "best_score": float(gs.best_score_),
+        "train_rows": int(len(X)),
+        "n_features": int(len(features)),
+        "train_started_utc": t0.isoformat(),
+        "train_finished_utc": t1.isoformat(),
+        "duration_sec": (t1 - t0).total_seconds(),
+        "date_start": date_start,
+        "date_end": date_end
+    }
+    _save_metadata(out, meta)
     return out
 
 def train_svm_classifier(df, features, label_col='label', save_name='svm_class.joblib', n_splits=5, progress_callback=None):
@@ -81,7 +124,9 @@ def train_svm_classifier(df, features, label_col='label', save_name='svm_class.j
         'svc__gamma': ['scale']
     }
     gs = GridSearchCV(pipe, param_grid, cv=tscv, scoring='f1_macro', n_jobs=1, verbose=1)
+    t0 = datetime.utcnow()
     gs.fit(X, y_m)
+    t1 = datetime.utcnow()
     best_model = gs.best_estimator_
     if progress_callback:
         from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
@@ -91,9 +136,15 @@ def train_svm_classifier(df, features, label_col='label', save_name='svm_class.j
         split_scores = [gs.cv_results_[f'split{i}_test_score'][best_idx] for i in range(n_splits)]
         tscv = TimeSeriesSplit(n_splits=n_splits)
         fold_metrics = []
+        fold_ranges = []
         for i, (train_idx, test_idx) in enumerate(tscv.split(X)):
             X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
             y_train, y_test = y_m.iloc[train_idx], y_m.iloc[test_idx]
+            if 'Date' in df.columns:
+                fold_ranges.append({
+                    "train": [str(df['Date'].iloc[train_idx[0]]), str(df['Date'].iloc[train_idx[-1]])],
+                    "test": [str(df['Date'].iloc[test_idx[0]]), str(df['Date'].iloc[test_idx[-1]])]
+                })
             model = best_model.fit(X_train, y_train)
             preds = model.predict(X_test)
             preds_orig = preds - 1
@@ -110,11 +161,29 @@ def train_svm_classifier(df, features, label_col='label', save_name='svm_class.j
             "std_test_score": float(std_test_scores[best_idx]),
             "split_test_scores": [float(s) for s in split_scores],
             "fold_metrics": fold_metrics,
-            "n_splits": n_splits
+            "n_splits": n_splits,
+            "fold_ranges": fold_ranges
         })
         progress_callback({"type": "done", "path": str(save_name), "best_params": gs.best_params_, "best_score": gs.best_score_})
     out = MODELS_DIR / save_name
     joblib.dump(best_model, out)
+    date_start = str(df['Date'].min()) if 'Date' in df.columns else None
+    date_end = str(df['Date'].max()) if 'Date' in df.columns else None
+    meta = {
+        "model_file": str(out.name),
+        "model_type": "SVMClassifier",
+        "n_splits": n_splits,
+        "best_params": gs.best_params_,
+        "best_score": float(gs.best_score_),
+        "train_rows": int(len(X)),
+        "n_features": int(len(features)),
+        "train_started_utc": t0.isoformat(),
+        "train_finished_utc": t1.isoformat(),
+        "duration_sec": (t1 - t0).total_seconds(),
+        "date_start": date_start,
+        "date_end": date_end
+    }
+    _save_metadata(out, meta)
     return out
 
 def train_svm_regressor(df, features, target_col='next_close', save_name='svm_reg.joblib', n_splits=5, progress_callback=None):
@@ -136,7 +205,9 @@ def train_svm_regressor(df, features, target_col='next_close', save_name='svm_re
         'svr__gamma': ['scale', 'auto']
     }
     gs = GridSearchCV(pipe, param_grid, cv=tscv, scoring='r2', n_jobs=1, verbose=1)
+    t0 = datetime.utcnow()
     gs.fit(X, y)
+    t1 = datetime.utcnow()
     best_model = gs.best_estimator_
     if progress_callback:
         from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
@@ -167,6 +238,23 @@ def train_svm_regressor(df, features, target_col='next_close', save_name='svm_re
         progress_callback({"type": "done", "path": str(save_name), "best_params": gs.best_params_, "best_score": gs.best_score_})
     out = MODELS_DIR / save_name
     joblib.dump(best_model, out)
+    date_start = str(df['Date'].min()) if 'Date' in df.columns else None
+    date_end = str(df['Date'].max()) if 'Date' in df.columns else None
+    meta = {
+        "model_file": str(out.name),
+        "model_type": "SVMRegressor",
+        "n_splits": n_splits,
+        "best_params": gs.best_params_,
+        "best_score": float(gs.best_score_),
+        "train_rows": int(len(X)),
+        "n_features": int(len(features)),
+        "train_started_utc": t0.isoformat(),
+        "train_finished_utc": t1.isoformat(),
+        "duration_sec": (t1 - t0).total_seconds(),
+        "date_start": date_start,
+        "date_end": date_end
+    }
+    _save_metadata(out, meta)
     return out
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
@@ -213,7 +301,9 @@ def train_xgb_classifier(df, features, label_col='label', save_name='xgb_class.j
         'xgb__reg_lambda': [1]
     }
     gs = GridSearchCV(pipe, param_grid, cv=tscv, scoring='f1_macro', n_jobs=1, verbose=1)
+    t0 = datetime.utcnow()
     gs.fit(X, y_m)
+    t1 = datetime.utcnow()
     best_model = gs.best_estimator_
     if progress_callback:
         from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
@@ -223,9 +313,15 @@ def train_xgb_classifier(df, features, label_col='label', save_name='xgb_class.j
         split_scores = [gs.cv_results_[f'split{i}_test_score'][best_idx] for i in range(n_splits)]
         tscv = TimeSeriesSplit(n_splits=n_splits)
         fold_metrics = []
+        fold_ranges = []
         for i, (train_idx, test_idx) in enumerate(tscv.split(X)):
             X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
             y_train, y_test = y_m.iloc[train_idx], y_m.iloc[test_idx]
+            if 'Date' in df.columns:
+                fold_ranges.append({
+                    "train": [str(df['Date'].iloc[train_idx[0]]), str(df['Date'].iloc[train_idx[-1]])],
+                    "test": [str(df['Date'].iloc[test_idx[0]]), str(df['Date'].iloc[test_idx[-1]])]
+                })
             model = best_model.fit(X_train, y_train)
             preds = model.predict(X_test)
             preds_orig = preds - 1
@@ -242,11 +338,29 @@ def train_xgb_classifier(df, features, label_col='label', save_name='xgb_class.j
             "std_test_score": float(std_test_scores[best_idx]),
             "split_test_scores": [float(s) for s in split_scores],
             "fold_metrics": fold_metrics,
-            "n_splits": n_splits
+            "n_splits": n_splits,
+            "fold_ranges": fold_ranges
         })
         progress_callback({"type": "done", "path": str(save_name), "best_params": gs.best_params_, "best_score": gs.best_score_})
     out = MODELS_DIR / save_name
     joblib.dump(best_model, out)
+    date_start = str(df['Date'].min()) if 'Date' in df.columns else None
+    date_end = str(df['Date'].max()) if 'Date' in df.columns else None
+    meta = {
+        "model_file": str(out.name),
+        "model_type": "XGBClassifier",
+        "n_splits": n_splits,
+        "best_params": gs.best_params_,
+        "best_score": float(gs.best_score_),
+        "train_rows": int(len(X)),
+        "n_features": int(len(features)),
+        "train_started_utc": t0.isoformat(),
+        "train_finished_utc": t1.isoformat(),
+        "duration_sec": (t1 - t0).total_seconds(),
+        "date_start": date_start,
+        "date_end": date_end
+    }
+    _save_metadata(out, meta)
     return out
 
 def train_ann_classifier(df, features, label_col='label', save_name='ann_class.joblib', n_splits=5, progress_callback=None):
@@ -273,7 +387,9 @@ def train_ann_classifier(df, features, label_col='label', save_name='ann_class.j
         'ann__activation': ['relu']
     }
     gs = GridSearchCV(pipe, param_grid, cv=tscv, scoring='f1_macro', n_jobs=1, verbose=1)
+    t0 = datetime.utcnow()
     gs.fit(X, y_m)
+    t1 = datetime.utcnow()
     best_model = gs.best_estimator_
     if progress_callback:
         from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
@@ -283,9 +399,15 @@ def train_ann_classifier(df, features, label_col='label', save_name='ann_class.j
         split_scores = [gs.cv_results_[f'split{i}_test_score'][best_idx] for i in range(n_splits)]
         tscv = TimeSeriesSplit(n_splits=n_splits)
         fold_metrics = []
+        fold_ranges = []
         for i, (train_idx, test_idx) in enumerate(tscv.split(X)):
             X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
             y_train, y_test = y_m.iloc[train_idx], y_m.iloc[test_idx]
+            if 'Date' in df.columns:
+                fold_ranges.append({
+                    "train": [str(df['Date'].iloc[train_idx[0]]), str(df['Date'].iloc[train_idx[-1]])],
+                    "test": [str(df['Date'].iloc[test_idx[0]]), str(df['Date'].iloc[test_idx[-1]])]
+                })
             model = best_model.fit(X_train, y_train)
             preds = model.predict(X_test)
             preds_orig = preds - 1
@@ -302,11 +424,29 @@ def train_ann_classifier(df, features, label_col='label', save_name='ann_class.j
             "std_test_score": float(std_test_scores[best_idx]),
             "split_test_scores": [float(s) for s in split_scores],
             "fold_metrics": fold_metrics,
-            "n_splits": n_splits
+            "n_splits": n_splits,
+            "fold_ranges": fold_ranges
         })
         progress_callback({"type": "done", "path": str(save_name), "best_params": gs.best_params_, "best_score": gs.best_score_})
     out = MODELS_DIR / save_name
     joblib.dump(best_model, out)
+    date_start = str(df['Date'].min()) if 'Date' in df.columns else None
+    date_end = str(df['Date'].max()) if 'Date' in df.columns else None
+    meta = {
+        "model_file": str(out.name),
+        "model_type": "ANNClassifier",
+        "n_splits": n_splits,
+        "best_params": gs.best_params_,
+        "best_score": float(gs.best_score_),
+        "train_rows": int(len(X)),
+        "n_features": int(len(features)),
+        "train_started_utc": t0.isoformat(),
+        "train_finished_utc": t1.isoformat(),
+        "duration_sec": (t1 - t0).total_seconds(),
+        "date_start": date_start,
+        "date_end": date_end
+    }
+    _save_metadata(out, meta)
     return out
 
 def train_xgb_regressor(df, features, target_col='next_close', save_name='xgb_reg.joblib', n_splits=5, progress_callback=None):
@@ -329,7 +469,9 @@ def train_xgb_regressor(df, features, target_col='next_close', save_name='xgb_re
     }
     pipe = Pipeline([('scaler', StandardScaler()), ('xgb', XGBRegressor())])
     gs = GridSearchCV(pipe, param_grid, cv=tscv, scoring='r2', n_jobs=1, verbose=1)
+    t0 = datetime.utcnow()
     gs.fit(X, y)
+    t1 = datetime.utcnow()
     best_model = gs.best_estimator_
     if progress_callback:
         from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
@@ -360,6 +502,23 @@ def train_xgb_regressor(df, features, target_col='next_close', save_name='xgb_re
         progress_callback({"type": "done", "path": str(save_name), "best_params": gs.best_params_, "best_score": gs.best_score_})
     out = MODELS_DIR / save_name
     joblib.dump(best_model, out)
+    date_start = str(df['Date'].min()) if 'Date' in df.columns else None
+    date_end = str(df['Date'].max()) if 'Date' in df.columns else None
+    meta = {
+        "model_file": str(out.name),
+        "model_type": "XGBRegressor",
+        "n_splits": n_splits,
+        "best_params": gs.best_params_,
+        "best_score": float(gs.best_score_),
+        "train_rows": int(len(X)),
+        "n_features": int(len(features)),
+        "train_started_utc": t0.isoformat(),
+        "train_finished_utc": t1.isoformat(),
+        "duration_sec": (t1 - t0).total_seconds(),
+        "date_start": date_start,
+        "date_end": date_end
+    }
+    _save_metadata(out, meta)
     return out
 
 def train_ann_regressor(df, features, target_col='next_close', save_name='ann_reg.joblib', n_splits=5, progress_callback=None):
@@ -385,7 +544,9 @@ def train_ann_regressor(df, features, target_col='next_close', save_name='ann_re
         'ann__activation': ['relu', 'tanh']
     }
     gs = GridSearchCV(pipe, param_grid, cv=tscv, scoring='r2', n_jobs=1, verbose=1)
+    t0 = datetime.utcnow()
     gs.fit(X, y)
+    t1 = datetime.utcnow()
     best_model = gs.best_estimator_
     if progress_callback:
         from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
@@ -416,6 +577,23 @@ def train_ann_regressor(df, features, target_col='next_close', save_name='ann_re
         progress_callback({"type": "done", "path": str(save_name), "best_params": gs.best_params_, "best_score": gs.best_score_})
     out = MODELS_DIR / save_name
     joblib.dump(best_model, out)
+    date_start = str(df['Date'].min()) if 'Date' in df.columns else None
+    date_end = str(df['Date'].max()) if 'Date' in df.columns else None
+    meta = {
+        "model_file": str(out.name),
+        "model_type": "ANNRegressor",
+        "n_splits": n_splits,
+        "best_params": gs.best_params_,
+        "best_score": float(gs.best_score_),
+        "train_rows": int(len(X)),
+        "n_features": int(len(features)),
+        "train_started_utc": t0.isoformat(),
+        "train_finished_utc": t1.isoformat(),
+        "duration_sec": (t1 - t0).total_seconds(),
+        "date_start": date_start,
+        "date_end": date_end
+    }
+    _save_metadata(out, meta)
     return out
 def load_model(path):
     return joblib.load(path)
@@ -427,3 +605,28 @@ def predict_with_model(model, X_df, features, is_classifier=True):
         # 0/1/2 -> -1/0/1 (app expects -1/0/1)
         return preds - 1
     return preds
+
+
+def predict_proba_with_model(model, X_df, features):
+    """Return class probabilities for classes mapped to -1,0,1 order.
+    Expects underlying classifier to support predict_proba with classes [0,1,2].
+    Returns ndarray of shape (n_samples, 3) in order [P(-1), P(0), P(1)].
+    """
+    X = X_df[features]
+    if hasattr(model, 'predict_proba'):
+        probs = model.predict_proba(X)
+        # Most pipelines keep class order as seen during fit: [0,1,2]
+        # Map to [-1,0,1] by reindexing columns if available
+        try:
+            classes_ = model.classes_ if hasattr(model, 'classes_') else None
+        except Exception:
+            classes_ = None
+        if classes_ is not None:
+            # classes_ likely [0,1,2]; create index map
+            order = {0:0, 1:1, 2:2}
+            idx = [order.get(int(c), None) for c in classes_]
+            if None not in idx:
+                probs = probs[:, idx]
+        return probs
+    # Fallback: no probabilities available
+    return None
