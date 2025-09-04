@@ -1,4 +1,4 @@
-# src/app.py
+
 """
 Top-nav sticky Streamlit app with unique widget keys to avoid duplicate ID errors.
 Run from project root:
@@ -16,15 +16,11 @@ import requests
 import yfinance as yf
 import joblib
 import time
-
-# local modules (must be importable when run from project root)
 from src.data import download_ticker
 from src.labeling import create_class_labels, create_reg_target
 from src.features import add_basic_features
 from src.model import train_xgb_classifier, train_xgb_regressor, train_ann_classifier, train_ann_regressor, load_model, predict_with_model
 from src.model import train_nb_classifier, train_svm_classifier, train_svm_regressor
-import numpy as np
-import pandas as pd
 def load_local_combined():
     """Load historical_all.csv into memory."""
     data_path = Path(__file__).resolve().parents[1] / "data" / "historical_all.csv"
@@ -386,6 +382,7 @@ st.markdown("""
 menu_items = {
     "Home": "🏠",
     "Predictor": "📈",
+    "Summary": "📊",
     "Train": "⚙️",
     "Assets": "💹",
     "Models": "🗂️",
@@ -441,7 +438,7 @@ if PAGE == "Home":
 
     st.info(f"Scanning {len(tickers_to_check)} instruments for predictions using {home_model_type} (regression preferred).")
 
-    def compute_pred_for_ticker(ticker, horizon=1):
+    def compute_pred_for_ticker(ticker, horizon=None):
         out = {"ticker": ticker, "name": None, "current": None, "pred": None, "pct": None, "model": None, "class_dir": None}
         try:
             name = None
@@ -482,11 +479,12 @@ if PAGE == "Home":
                 reg_prefix = "xgb_reg_"
                 class_prefix = "xgb_class_"
 
-            # Try regression model first
-            reg_path = safe_latest_model(reg_prefix, ticker, horizon=horizon)
+            # Always use horizon=1 for model and features
+            fixed_horizon = 1
+            reg_path = safe_latest_model(reg_prefix, ticker, horizon=fixed_horizon)
             if reg_path:
                 out['model'] = reg_path.name
-                df = create_reg_target(df_raw, horizon=horizon)
+                df = create_reg_target(df_raw, horizon=fixed_horizon)
                 df = add_basic_features(df)
                 non_features = {"Date", "next_close"}
                 features = [c for c in df.columns if c not in non_features and np.issubdtype(df[c].dtype, np.number)]
@@ -499,11 +497,10 @@ if PAGE == "Home":
                 out['pct'] = (pred - current) / current * 100.0 if current != 0 else None
                 return out
 
-            # If no reg model, try classification to get direction
-            class_path = safe_latest_model(class_prefix, ticker, horizon=horizon)
+            class_path = safe_latest_model(class_prefix, ticker, horizon=fixed_horizon)
             if class_path:
                 out['model'] = class_path.name
-                df = create_class_labels(df_raw, horizon=horizon)
+                df = create_class_labels(df_raw, horizon=fixed_horizon)
                 df = add_basic_features(df)
                 non_features = {"Date", "next_close", "ret_next", "label"}
                 features = [c for c in df.columns if c not in non_features and np.issubdtype(df[c].dtype, np.number)]
@@ -1058,9 +1055,80 @@ if PAGE == "Train":
                         continue
                     st.success(f"Saved regressor: {Path(out).name}")
 
-            # finalize UI
+                        # finalize UI
             progress_bar.progress(100)
             status.markdown("All training completed.")
+    # --- Holdout Evaluation Section ---
+    st.markdown("---")
+    st.header("Evaluate Model on Holdout Data (Unseen)")
+    st.markdown("Test your trained models on unseen data to verify real-world performance.")
+
+    import os
+    from sklearn.metrics import classification_report, mean_absolute_error, mean_squared_error, r2_score
+
+    # Model selection
+    model_dir = str(MODELS_DIR)
+    model_files = [f for f in os.listdir(model_dir) if f.endswith('.joblib')]
+    if not model_files:
+        st.info("No trained models found in /models. Train a model first.")
+    else:
+        model_choice = st.selectbox('Select a trained model:', model_files, key='eval_model_choice')
+
+        # Data selection
+        data_dir = str(BASE / 'data')
+        data_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
+        if not data_files:
+            st.info("No CSV data files found in /data.")
+        else:
+            data_choice = st.selectbox('Select a dataset:', data_files, key='eval_data_choice')
+            df = pd.read_csv(os.path.join(data_dir, data_choice))
+            # Automatically add next_close if missing and Close exists
+            if 'next_close' not in df.columns and 'Close' in df.columns:
+                df['next_close'] = df['Close'].shift(-1)
+                df = df.dropna(subset=['next_close'])
+            task_type = st.radio('Task type:', ['Classification', 'Regression'], key='eval_task_type')
+            test_size = st.slider('Holdout set size (percent)', 10, 50, 20, key='eval_test_size')
+            train_df = df.iloc[:-int(len(df)*test_size/100)]
+            holdout_df = df.iloc[-int(len(df)*test_size/100):]
+
+            if st.button('Evaluate on Holdout', key='eval_run'):
+                model_path = os.path.join(model_dir, model_choice)
+                trained_model = load_model(model_path)
+                # Apply feature engineering to holdout set
+                from src.features import add_basic_features
+                holdout_df_fe = add_basic_features(holdout_df.copy())
+                # Force features to match those used during model training
+                if hasattr(trained_model, 'feature_names_in_'):
+                    features = list(trained_model.feature_names_in_)
+                else:
+                    # Fallback: use all columns except targets and date
+                    features = [col for col in holdout_df_fe.columns if col not in ['label', 'next_close', 'date', 'Date']]
+                X_holdout = holdout_df_fe[features]
+                if task_type == 'Classification':
+                    if 'label' not in holdout_df_fe.columns:
+                        st.error("No 'label' column in holdout set after feature engineering.")
+                    else:
+                        y_holdout = holdout_df_fe['label']
+                        preds = trained_model.predict(X_holdout)
+                        if hasattr(trained_model, 'predict') and (preds.min() >= 0):
+                            preds = preds - 1
+                        report = classification_report(y_holdout, preds, output_dict=True)
+                        st.subheader('Classification Report (Holdout Set)')
+                        st.json(report)
+                else:
+                    if 'next_close' not in holdout_df_fe.columns:
+                        st.error("No 'next_close' column in holdout set after feature engineering.")
+                    else:
+                        y_holdout = holdout_df_fe['next_close']
+                        preds = trained_model.predict(X_holdout)
+                        mae = mean_absolute_error(y_holdout, preds)
+                        import numpy as np
+                        rmse = np.sqrt(mean_squared_error(y_holdout, preds))
+                        r2 = r2_score(y_holdout, preds)
+                        st.subheader('Regression Metrics (Holdout Set)')
+                        st.write(f'MAE: {mae:.4f}')
+                        st.write(f'RMSE: {rmse:.4f}')
+                        st.write(f'R2: {r2:.4f}')
 
 # ---------------------------
 # ASSETS (unique key for choice)
@@ -1277,6 +1345,147 @@ if PAGE == "Models":
         for p in models:
             st.write(p.name, "| size KB:", int(p.stat().st_size/1024), "| modified:", time.ctime(p.stat().st_mtime))
 
+# ---------------------------
+# SUMMARY PAGE (unique key)
+# ---------------------------
+
+
+if PAGE == "Summary":
+    st.title("Model Comparison Summary")
+    st.markdown("Select a stock to compare predictions from all models.")
+
+    asset_map = build_asset_map_from_combined()
+    asset_type = st.selectbox("Asset type", list(asset_map.keys()), key="summary_asset_type")
+    available = asset_map[asset_type]
+    ticker = st.selectbox("Choose ticker", list(available.keys()), format_func=lambda x: f"{x} — {available[x]}", key="summary_ticker")
+    horizon_map = {"1 day": 1, "1 week (~5 trading days)": 5, "1 month (~21 trading days)": 21}
+    horizon_choice = st.selectbox("Prediction horizon", list(horizon_map.keys()), index=0, key="summary_horizon")
+    horizon = horizon_map[horizon_choice]
+    mode = st.selectbox("Task", ["Classification (direction)", "Regression (price)"], key="summary_mode")
+    start = st.text_input("Start date (YYYY-MM-DD)", "2018-01-01", key="summary_start")
+    end = st.text_input("End date (YYYY-MM-DD or empty)", "", key="summary_end")
+
+    # Load and prepare data
+    df_raw = get_ticker_data(ticker, start=start, end=end if end else None)
+    if df_raw is None or df_raw.empty:
+        st.error(f"No data for {ticker}")
+    else:
+        df_raw = prepare_df_numeric(df_raw)
+        if mode.startswith("Class"):
+            df = create_class_labels(df_raw, horizon=horizon)
+        else:
+            df = create_reg_target(df_raw, horizon=horizon)
+        df = add_basic_features(df)
+        if df is None or df.empty:
+            st.error(f"No valid data for {ticker}")
+        else:
+            model_types = ["XGBoost", "ANN", "SVM", "Naive Bayes"]
+            preds_dict = {}
+            metrics_dict = {}
+            debug_msgs = []
+            for mtype in model_types:
+                if mtype == "XGBoost":
+                    prefix = "xgb_class_" if mode.startswith("Class") else "xgb_reg_"
+                elif mtype == "ANN":
+                    prefix = "ann_class_" if mode.startswith("Class") else "ann_reg_"
+                elif mtype == "SVM":
+                    prefix = "svm_class_" if mode.startswith("Class") else "svm_reg_"
+                elif mtype == "Naive Bayes":
+                    if mode.startswith("Class"):
+                        prefix = "nb_class_"
+                    else:
+                        # Naive Bayes is classification only
+                        debug_msgs.append("[INFO] Naive Bayes: No regression model.")
+                        preds_dict[mtype] = None
+                        metrics_dict[mtype] = None
+                        continue
+                else:
+                    continue
+                model_path = safe_latest_model(prefix, ticker, horizon=horizon)
+                if model_path:
+                    try:
+                        model = load_model(model_path)
+                        features = [c for c in df.columns if c not in {'Date','next_close','ret_next','label'} and np.issubdtype(df[c].dtype, np.number)]
+                        preds = predict_with_model(model, df, features, is_classifier=mode.startswith("Class"))
+                        preds_dict[mtype] = preds
+                        if mode.startswith("Class"):
+                            from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+                            if 'label' not in df.columns:
+                                debug_msgs.append(f"[ERROR] {mtype}: 'label' column missing in DataFrame after feature engineering.")
+                                metrics_dict[mtype] = None
+                            else:
+                                y_true = df['label']
+                                acc = accuracy_score(y_true, preds)
+                                prec = precision_score(y_true, preds, average='weighted', zero_division=0)
+                                rec = recall_score(y_true, preds, average='weighted', zero_division=0)
+                                f1 = f1_score(y_true, preds, average='weighted', zero_division=0)
+                                metrics_dict[mtype] = {
+                                    'Accuracy': acc,
+                                    'Precision': prec,
+                                    'Recall': rec,
+                                    'F1 Score': f1
+                                }
+                    except Exception as e:
+                        debug_msgs.append(f"[ERROR] {mtype}: {str(e)}")
+                        preds_dict[mtype] = None
+                        metrics_dict[mtype] = None
+                else:
+                    debug_msgs.append(f"[INFO] {mtype}: No model file found for {prefix}{ticker}_h{horizon}.joblib")
+                    preds_dict[mtype] = None
+                    metrics_dict[mtype] = None
+
+            if mode.startswith("Regress"):
+                # Plot all regression predictions
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=df['Date'], y=df['Close'], mode='lines', name='Actual', line=dict(color='black')))
+                colors = {'XGBoost': 'blue', 'ANN': 'green', 'SVM': 'red'}
+                regression_metrics_table = []
+                from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+                for mtype in model_types:
+                    preds = preds_dict.get(mtype)
+                    if preds is not None:
+                        fig.add_trace(go.Scatter(x=df['Date'], y=preds, mode='lines', name=mtype, line=dict(color=colors[mtype], dash='dash')))
+                        y_true = df['next_close'] if 'next_close' in df.columns else df['Close'].shift(-1)
+                        y_true = y_true.dropna()
+                        y_pred = pd.Series(preds, index=df.index)
+                        y_pred = y_pred.loc[y_true.index]
+                        mae = mean_absolute_error(y_true, y_pred)
+                        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+                        r2 = r2_score(y_true, y_pred)
+                        regression_metrics_table.append({
+                            "Model": mtype,
+                            "MAE": mae,
+                            "RMSE": rmse,
+                            "R2": r2
+                        })
+                fig.update_layout(title=f"{ticker} — Regression Model Predictions", xaxis_title="Date", yaxis_title="Price")
+                st.plotly_chart(fig, use_container_width=True)
+                # Show regression metrics table
+                st.subheader("Regression Metrics Comparison")
+                if regression_metrics_table:
+                    st.dataframe(pd.DataFrame(regression_metrics_table).set_index("Model"))
+                    used_models = [row["Model"] for row in regression_metrics_table]
+                    st.caption(f"Models compared: {', '.join(used_models)}")
+                else:
+                    st.info("No regression results available.")
+            else:
+                # Show classification metrics table
+                st.subheader("Classification Metrics Comparison")
+                metrics_table = []
+                for mtype in model_types:
+                    m = metrics_dict.get(mtype)
+                    if m:
+                        metrics_table.append({"Model": mtype, **m})
+                if metrics_table:
+                    st.dataframe(pd.DataFrame(metrics_table).set_index("Model"))
+                    used_models = [row["Model"] for row in metrics_table]
+                    st.caption(f"Models compared: {', '.join(used_models)}")
+                else:
+                    st.info("No classification results available.")
+                if debug_msgs:
+                    with st.expander("Show debug info"):
+                        for msg in debug_msgs:
+                            st.write(msg)
 # ---------------------------
 # ABOUT
 # ---------------------------
