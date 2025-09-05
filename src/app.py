@@ -25,6 +25,16 @@ from src.model import (
     load_model, predict_with_model, predict_proba_with_model
 )
 from src.model import train_nb_classifier, train_svm_classifier, train_svm_regressor
+
+# Small utility to safely rerun Streamlit after updating session_state
+def _safe_rerun():
+    try:
+        st.rerun()
+    except Exception:
+        try:
+            st.experimental_rerun()
+        except Exception:
+            pass
 def load_local_combined():
     """Load historical_all.csv into memory."""
     data_path = Path(__file__).resolve().parents[1] / "data" / "historical_all.csv"
@@ -1768,11 +1778,24 @@ if PAGE == "Compare":
     available = asset_map[asset_type]
     preferred_stock_defaults = ["BAC", "NKE", "TSLA", "CRM", "INTC"]
     default_tickers = [t for t in preferred_stock_defaults if t in available.keys()] if asset_type == "Stocks" else list(available.keys())[:2]
+    # Multiselect with Select All / Clear buttons
+    # Initialize and control selection via session_state BEFORE rendering widget
+    if "cmp_tickers" not in st.session_state:
+        st.session_state.cmp_tickers = default_tickers
+    c_sel_all, c_clear = st.columns([1,1])
+    with c_sel_all:
+        if st.button("Select All", key="cmp_sel_all"):
+            st.session_state.cmp_tickers = list(available.keys())
+            _safe_rerun()
+    with c_clear:
+        if st.button("Clear", key="cmp_sel_clear"):
+            st.session_state.cmp_tickers = []
+            _safe_rerun()
     tickers = st.multiselect(
         "Choose tickers",
         options=list(available.keys()),
         format_func=lambda x: f"{x} — {available[x]}",
-        default=default_tickers,
+        default=st.session_state.cmp_tickers,
         key="cmp_tickers"
     )
 
@@ -1863,7 +1886,7 @@ if PAGE == "Compare":
                             st.plotly_chart(fig, use_container_width=True)
                         i += 1
 
-            # Results table
+            # Results table and evaluation
             st.markdown("---")
             st.subheader("Metrics Table")
             if rows:
@@ -1880,6 +1903,71 @@ if PAGE == "Compare":
                     .sort_values("F1", ascending=False)
                 )
                 st.dataframe(agg)
+                # Evaluate overall best model: mean F1 (performance) and stability (std of F1 across tickers)
+                st.markdown("#### Evaluation: Best Overall Model")
+                perf = dfm.dropna(subset=["F1"]).groupby("Model")["F1"].agg(["mean","std"]).rename(columns={"mean":"F1_mean","std":"F1_std"})
+                # Stability-first selection: lowest std (tie-breaker highest mean)
+                perf = perf.sort_values(["F1_std", "F1_mean"], ascending=[True, False])
+                best_model = perf.index[0] if len(perf) else None
+                if best_model:
+                    bm = perf.loc[best_model]
+                    st.markdown(
+                        f"""
+                        <div style='border:1px solid #cfe8cf;background:#f2fbf2;padding:10px 14px;border-radius:8px;'>
+                          <b>Chosen model:</b> <span style='color:#1e7e34'>{best_model}</span>
+                          &nbsp;|&nbsp; F1 mean = <b>{bm['F1_mean']:.4f}</b>
+                          &nbsp;|&nbsp; F1 std = <b>{(bm['F1_std'] if bm['F1_std']==bm['F1_std'] else 0):.4f}</b>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    # Show calculation table with std and highlight selected
+                    def _hl(row):
+                        color = '#fff3cd' if row.name == best_model else ''
+                        return [f'background-color: {color}'] * len(row)
+                    st.markdown("Calculation table (mean ± std)")
+                    st.dataframe(
+                        perf.rename(columns={"F1_mean":"F1_mean","F1_std":"F1_std"})
+                            .fillna(0)
+                            .style.format({"F1_mean":"{:.4f}", "F1_std":"{:.4f}"})
+                            .apply(_hl, axis=1)
+                    )
+                else:
+                    st.write("Chosen model:", "—")
+
+                # Visualization: bar of F1_mean and error bars for stability; box plots per model
+                try:
+                    import plotly.graph_objects as go
+                    fig1 = go.Figure()
+                    x = perf.index.tolist()
+                    y = perf["F1_mean"].tolist()
+                    err = perf["F1_std"].fillna(0).tolist()
+                    colors = ["#2ca02c" if m==best_model else "#1f77b4" for m in x]
+                    fig1.add_trace(go.Bar(x=x, y=y, error_y=dict(type='data', array=err, visible=True), marker_color=colors))
+                    fig1.update_layout(title="Overall Performance (F1 mean) with Stability (std)", yaxis_title="F1 (weighted)", xaxis_title="Model", height=380)
+                    st.plotly_chart(fig1, use_container_width=True)
+
+                    # Box plot of F1 per model across tickers
+                    df_box = dfm.dropna(subset=["F1"]).copy()
+                    import plotly.express as px
+                    fig2 = px.box(df_box, x="Model", y="F1", points="all", color="Model")
+                    fig2.update_layout(title="Distribution of F1 by Model (stability across tickers)", height=380, showlegend=False)
+                    st.plotly_chart(fig2, use_container_width=True)
+                except Exception as e:
+                    st.info(f"Plotting issue: {e}")
+                # Styled tables highlighting best model row
+                try:
+                    def _hl_row(row):
+                        style = [""] * len(row)
+                        if row.name == best_model:
+                            style = ["background-color: #e7f7e7; font-weight:700" for _ in row]
+                        return style
+                    st.markdown("##### F1 mean/std (highlighted)")
+                    st.dataframe(perf.style.apply(_hl_row, axis=1))
+                    st.markdown("##### Aggregated metrics (highlighted by best F1)")
+                    st.dataframe(agg.style.apply(lambda r: ["background-color: #e7f7e7; font-weight:700" if r.name==best_model else "" for _ in r], axis=1))
+                except Exception:
+                    pass
                 # Export options
                 col_a, col_b = st.columns([1,1])
                 with col_a:
@@ -1911,7 +1999,37 @@ if PAGE == "Summary":
     asset_map = build_asset_map_from_combined()
     asset_type = st.selectbox("Asset type", list(asset_map.keys()), key="summary_asset_type")
     available = asset_map[asset_type]
-    ticker = st.selectbox("Choose ticker", list(available.keys()), format_func=lambda x: f"{x} — {available[x]}", key="summary_ticker")
+    # Switch to multiselect with Select All for broader comparison; default to first 1-3
+    tickers_all = list(available.keys())
+    default_tks = tickers_all[:3]
+    if "summary_tickers" not in st.session_state:
+        st.session_state.summary_tickers = default_tks
+    # Flags to safely update selection before widget instantiation
+    if "sum_select_all_flag" not in st.session_state:
+        st.session_state.sum_select_all_flag = False
+    if "sum_clear_flag" not in st.session_state:
+        st.session_state.sum_clear_flag = False
+    s_all, s_clear = st.columns([1,1])
+    with s_all:
+        st.button(
+            "Select All",
+            key="sum_sel_all",
+            on_click=lambda: st.session_state.update({"sum_select_all_flag": True})
+        )
+    with s_clear:
+        st.button(
+            "Clear",
+            key="sum_sel_clear",
+            on_click=lambda: st.session_state.update({"sum_clear_flag": True})
+        )
+    # Apply pending selection changes BEFORE creating the multiselect widget
+    if st.session_state.sum_select_all_flag:
+        st.session_state.summary_tickers = tickers_all
+        st.session_state.sum_select_all_flag = False
+    if st.session_state.sum_clear_flag:
+        st.session_state.summary_tickers = []
+        st.session_state.sum_clear_flag = False
+    tickers = st.multiselect("Choose tickers", tickers_all, default=st.session_state.summary_tickers, format_func=lambda x: f"{x} — {available[x]}", key="summary_tickers")
     horizon_map = {"1 day": 1, "1 week (~5 trading days)": 5, "1 month (~21 trading days)": 21}
     horizon_choice = st.selectbox("Prediction horizon", list(horizon_map.keys()), index=0, key="summary_horizon")
     horizon = horizon_map[horizon_choice]
@@ -1919,24 +2037,31 @@ if PAGE == "Summary":
     start = st.text_input("Start date (YYYY-MM-DD)", "2018-01-01", key="summary_start")
     end = st.text_input("End date (YYYY-MM-DD or empty)", "", key="summary_end")
 
-    # Load and prepare data
-    df_raw = get_ticker_data(ticker, start=start, end=end if end else None)
-    if df_raw is None or df_raw.empty:
-        st.error(f"No data for {ticker}")
+    # Guard
+    if not tickers:
+        st.info("Select at least one ticker.")
     else:
-        df_raw = prepare_df_numeric(df_raw)
-        if mode.startswith("Class"):
-            df = create_class_labels(df_raw, horizon=horizon)
-        else:
-            df = create_reg_target(df_raw, horizon=horizon)
-        df = add_basic_features(df)
-        if df is None or df.empty:
-            st.error(f"No valid data for {ticker}")
-        else:
-            model_types = ["XGBoost", "ANN", "SVM", "Naive Bayes"]
-            preds_dict = {}
-            metrics_dict = {}
-            debug_msgs = []
+        # For each selected ticker, compute metrics per model; then aggregate across tickers for evaluation
+        model_types = ["XGBoost", "ANN", "SVM", "Naive Bayes"]
+        all_rows = []
+        # For regression plotting: store per-ticker predictions per model
+        per_ticker_preds = {}
+        debug_msgs = []
+        for ticker in tickers:
+            df_raw = get_ticker_data(ticker, start=start, end=end if end else None)
+            if df_raw is None or df_raw.empty:
+                debug_msgs.append(f"[INFO] No data for {ticker}")
+                continue
+            df_raw = prepare_df_numeric(df_raw)
+            if mode.startswith("Class"):
+                df = create_class_labels(df_raw, horizon=horizon)
+            else:
+                df = create_reg_target(df_raw, horizon=horizon)
+            df = add_basic_features(df)
+            if df is None or df.empty:
+                debug_msgs.append(f"[INFO] No valid data for {ticker}")
+                continue
+            features = [c for c in df.columns if c not in {'Date','next_close','ret_next','label'} and np.issubdtype(df[c].dtype, np.number)]
             for mtype in model_types:
                 if mtype == "XGBoost":
                     prefix = "xgb_class_" if mode.startswith("Class") else "xgb_reg_"
@@ -1945,101 +2070,165 @@ if PAGE == "Summary":
                 elif mtype == "SVM":
                     prefix = "svm_class_" if mode.startswith("Class") else "svm_reg_"
                 elif mtype == "Naive Bayes":
-                    if mode.startswith("Class"):
-                        prefix = "nb_class_"
-                    else:
-                        # Naive Bayes is classification only
-                        debug_msgs.append("[INFO] Naive Bayes: No regression model.")
-                        preds_dict[mtype] = None
-                        metrics_dict[mtype] = None
+                    if not mode.startswith("Class"):
+                        debug_msgs.append("[INFO] Naive Bayes: classification only.")
                         continue
+                    prefix = "nb_class_"
                 else:
                     continue
                 model_path = safe_latest_model(prefix, ticker, horizon=horizon)
-                if model_path:
-                    try:
-                        model = load_model(model_path)
-                        features = [c for c in df.columns if c not in {'Date','next_close','ret_next','label'} and np.issubdtype(df[c].dtype, np.number)]
-                        preds = predict_with_model(model, df, features, is_classifier=mode.startswith("Class"))
-                        preds_dict[mtype] = preds
-                        if mode.startswith("Class"):
-                            from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-                            if 'label' not in df.columns:
-                                debug_msgs.append(f"[ERROR] {mtype}: 'label' column missing in DataFrame after feature engineering.")
-                                metrics_dict[mtype] = None
-                            else:
-                                y_true = df['label']
-                                acc = accuracy_score(y_true, preds)
-                                prec = precision_score(y_true, preds, average='weighted', zero_division=0)
-                                rec = recall_score(y_true, preds, average='weighted', zero_division=0)
-                                f1 = f1_score(y_true, preds, average='weighted', zero_division=0)
-                                metrics_dict[mtype] = {
-                                    'Accuracy': acc,
-                                    'Precision': prec,
-                                    'Recall': rec,
-                                    'F1 Score': f1
-                                }
-                    except Exception as e:
-                        debug_msgs.append(f"[ERROR] {mtype}: {str(e)}")
-                        preds_dict[mtype] = None
-                        metrics_dict[mtype] = None
-                else:
-                    debug_msgs.append(f"[INFO] {mtype}: No model file found for {prefix}{ticker}_h{horizon}.joblib")
-                    preds_dict[mtype] = None
-                    metrics_dict[mtype] = None
+                if not model_path:
+                    continue
+                try:
+                    model = load_model(model_path)
+                    preds = predict_with_model(model, df, features, is_classifier=mode.startswith("Class"))
+                    if mode.startswith("Class"):
+                        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+                        if 'label' not in df.columns:
+                            continue
+                        y_true = df['label']
+                        acc = accuracy_score(y_true, preds)
+                        prec = precision_score(y_true, preds, average='weighted', zero_division=0)
+                        rec = recall_score(y_true, preds, average='weighted', zero_division=0)
+                        f1 = f1_score(y_true, preds, average='weighted', zero_division=0)
+                        all_rows.append({"Ticker": ticker, "Model": mtype, "Accuracy": acc, "Precision": prec, "Recall": rec, "F1": f1})
+                    else:
+                        from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+                        if 'next_close' not in df.columns:
+                            continue
+                        y_true = df['next_close']
+                        # align preds length
+                        import numpy as _np
+                        y_true = y_true.iloc[-len(preds):]
+                        preds_s = pd.Series(preds, index=y_true.index)
+                        mae = mean_absolute_error(y_true, preds_s)
+                        rmse = float(_np.sqrt(mean_squared_error(y_true, preds_s)))
+                        r2 = r2_score(y_true, preds_s)
+                        all_rows.append({"Ticker": ticker, "Model": mtype, "MAE": mae, "RMSE": rmse, "R2": r2})
+                        # Save for plotting
+                        if ticker not in per_ticker_preds:
+                            per_ticker_preds[ticker] = {"dates": y_true.index.to_list(), "actual": y_true.to_list(), "models": {}}
+                        per_ticker_preds[ticker]["models"][mtype] = preds_s.to_list()
+                except Exception:
+                    continue
 
-            if mode.startswith("Regress"):
-                # Plot all regression predictions
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=df['Date'], y=df['Close'], mode='lines', name='Actual', line=dict(color='black')))
-                colors = {'XGBoost': 'blue', 'ANN': 'green', 'SVM': 'red'}
-                regression_metrics_table = []
-                from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-                for mtype in model_types:
-                    preds = preds_dict.get(mtype)
-                    if preds is not None:
-                        fig.add_trace(go.Scatter(x=df['Date'], y=preds, mode='lines', name=mtype, line=dict(color=colors[mtype], dash='dash')))
-                        y_true = df['next_close'] if 'next_close' in df.columns else df['Close'].shift(-1)
-                        y_true = y_true.dropna()
-                        y_pred = pd.Series(preds, index=df.index)
-                        y_pred = y_pred.loc[y_true.index]
-                        mae = mean_absolute_error(y_true, y_pred)
-                        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-                        r2 = r2_score(y_true, y_pred)
-                        regression_metrics_table.append({
-                            "Model": mtype,
-                            "MAE": mae,
-                            "RMSE": rmse,
-                            "R2": r2
-                        })
-                fig.update_layout(title=f"{ticker} — Regression Model Predictions", xaxis_title="Date", yaxis_title="Price")
-                st.plotly_chart(fig, use_container_width=True)
-                # Show regression metrics table
-                st.subheader("Regression Metrics Comparison")
-                if regression_metrics_table:
-                    st.dataframe(pd.DataFrame(regression_metrics_table).set_index("Model"))
-                    used_models = [row["Model"] for row in regression_metrics_table]
-                    st.caption(f"Models compared: {', '.join(used_models)}")
-                else:
-                    st.info("No regression results available.")
+        if not all_rows:
+            st.info("No results available for the selected configuration.")
+        else:
+            dfm = pd.DataFrame(all_rows)
+            if mode.startswith("Class"):
+                st.subheader("Classification Metrics — All Selected Tickers")
+                st.dataframe(dfm.set_index(["Ticker","Model"]))
+                # Evaluation
+                st.markdown("#### Evaluation: Best Overall Model")
+                perf = dfm.groupby("Model")["F1"].agg(["mean","std"]).rename(columns={"mean":"F1_mean","std":"F1_std"}).sort_values(["F1_std","F1_mean"], ascending=[True, False])
+                best_model = perf.index[0]
+                # Highlight card
+                bm = perf.loc[best_model]
+                st.markdown(
+                    f"""
+                    <div style='border:1px solid #cfe8cf;background:#f2fbf2;padding:10px 14px;border-radius:8px;'>
+                        <b>Chosen model:</b> <span style='color:#1e7e34'>{best_model}</span>
+                        &nbsp;|&nbsp; F1 mean = <b>{bm['F1_mean']:.4f}</b>
+                        &nbsp;|&nbsp; F1 std = <b>{(bm['F1_std'] if bm['F1_std']==bm['F1_std'] else 0):.4f}</b>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                # Show calculation table with std and highlight selected
+                def _hl2(row):
+                    color = '#fff3cd' if row.name == best_model else ''
+                    return [f'background-color: {color}'] * len(row)
+                st.markdown("Calculation table (mean ± std)")
+                st.dataframe(
+                    perf.fillna(0)
+                        .style.format({"F1_mean":"{:.4f}", "F1_std":"{:.4f}"})
+                        .apply(_hl2, axis=1)
+                )
+                # Charts
+                try:
+                    import plotly.express as px
+                    import plotly.graph_objects as go
+                    fig1 = go.Figure()
+                    fig1.add_trace(go.Bar(x=perf.index, y=perf['F1_mean'], error_y=dict(type='data', array=perf['F1_std'].fillna(0)), marker_color=["#2ca02c" if m==best_model else "#1f77b4" for m in perf.index]))
+                    fig1.update_layout(title="Overall Performance (F1 mean) with Stability (std)", yaxis_title="F1 (weighted)")
+                    st.plotly_chart(fig1, use_container_width=True)
+                    fig2 = px.box(dfm, x="Model", y="F1", color="Model")
+                    fig2.update_layout(title="F1 Distribution by Model across Selected Tickers", showlegend=False)
+                    st.plotly_chart(fig2, use_container_width=True)
+                except Exception as e:
+                    st.info(f"Plotting issue: {e}")
             else:
-                # Show classification metrics table
-                st.subheader("Classification Metrics Comparison")
-                metrics_table = []
-                for mtype in model_types:
-                    m = metrics_dict.get(mtype)
-                    if m:
-                        metrics_table.append({"Model": mtype, **m})
-                if metrics_table:
-                    st.dataframe(pd.DataFrame(metrics_table).set_index("Model"))
-                    used_models = [row["Model"] for row in metrics_table]
-                    st.caption(f"Models compared: {', '.join(used_models)}")
-                else:
-                    st.info("No classification results available.")
-                if debug_msgs:
-                    with st.expander("Show debug info"):
-                        for msg in debug_msgs:
-                            st.write(msg)
+                st.subheader("Regression Metrics — All Selected Tickers")
+                st.dataframe(dfm.set_index(["Ticker","Model"]))
+                # Stability-first for regression: pick lowest RMSE std (tie: lowest RMSE mean, then highest R2 mean)
+                perf = (
+                    dfm.groupby("Model")
+                    .agg(
+                        MAE_mean=("MAE","mean"), RMSE_mean=("RMSE","mean"), R2_mean=("R2","mean"),
+                        MAE_std=("MAE","std"), RMSE_std=("RMSE","std"), R2_std=("R2","std"),
+                    )
+                    .fillna(0)
+                )
+                perf = perf.sort_values(["RMSE_std","RMSE_mean","R2_mean"], ascending=[True, True, False])
+                best_model = perf.index[0]
+                st.markdown("#### Evaluation: Best Overall Model")
+                st.markdown(
+                    f"""
+                    <div style='border:1px solid #cfe8cf;background:#f2fbf2;padding:10px 14px;border-radius:8px;'>
+                        <b>Chosen model:</b> <span style='color:#1e7e34'>{best_model}</span>
+                        &nbsp;|&nbsp; Mean MAE = <b>{perf.loc[best_model,'MAE_mean']:.4f}</b>
+                        &nbsp;|&nbsp; Mean RMSE = <b>{perf.loc[best_model,'RMSE_mean']:.4f}</b>
+                        &nbsp;|&nbsp; Mean R2 = <b>{perf.loc[best_model,'R2_mean']:.4f}</b>
+                        &nbsp;|&nbsp; RMSE std = <b>{perf.loc[best_model,'RMSE_std']:.4f}</b>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                # Show calculation table with stds and highlight selected
+                def _hl3(row):
+                    color = '#fff3cd' if row.name == best_model else ''
+                    return [f'background-color: {color}'] * len(row)
+                st.markdown("Calculation table (means ± stds)")
+                st.dataframe(
+                    perf
+                        .style.format({
+                            "MAE_mean":"{:.4f}", "RMSE_mean":"{:.4f}", "R2_mean":"{:.4f}",
+                            "MAE_std":"{:.4f}", "RMSE_std":"{:.4f}", "R2_std":"{:.4f}"
+                        })
+                        .apply(_hl3, axis=1)
+                )
+                try:
+                    import plotly.graph_objects as go
+                    fig = go.Figure()
+                    fig.add_trace(go.Bar(name='MAE (lower better)', x=perf.index, y=perf['MAE_mean']))
+                    fig.add_trace(go.Bar(name='RMSE (lower better)', x=perf.index, y=perf['RMSE_mean']))
+                    fig.add_trace(go.Bar(name='R2 (higher better)', x=perf.index, y=perf['R2_mean']))
+                    fig.update_layout(barmode='group', title='Overall Regression Performance (means)')
+                    st.plotly_chart(fig, use_container_width=True)
+                except Exception as e:
+                    st.info(f"Plotting issue: {e}")
+
+                # Per-ticker overlay charts: Actual vs Predicted (per model)
+                if per_ticker_preds:
+                    st.markdown("#### Per‑ticker Prediction vs Actual")
+                    for tk in tickers:
+                        if tk not in per_ticker_preds:
+                            continue
+                        try:
+                            import plotly.graph_objects as go
+                            payload = per_ticker_preds[tk]
+                            dates = payload["dates"]
+                            figp = go.Figure()
+                            figp.add_trace(go.Scatter(x=dates, y=payload["actual"], mode='lines', name='Actual', line=dict(color='black')))
+                            color_map = {'XGBoost':'#1f77b4','ANN':'#2ca02c','SVM':'#d62728','Naive Bayes':'#9467bd'}
+                            for mtype, yhat in payload["models"].items():
+                                figp.add_trace(go.Scatter(x=dates, y=yhat, mode='lines', name=mtype, line=dict(color=color_map.get(mtype, None), dash='dash')))
+                            figp.update_layout(title=f"{tk} — Actual vs Predicted Next Close", xaxis_title="Date", yaxis_title="Price", height=420)
+                            with st.expander(f"{tk} chart", expanded=False):
+                                st.plotly_chart(figp, use_container_width=True)
+                        except Exception as e:
+                            st.info(f"Chart unavailable for {tk}: {e}")
 # ---------------------------
 # ABOUT
 # ---------------------------
