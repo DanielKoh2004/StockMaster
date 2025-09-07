@@ -1412,6 +1412,94 @@ if PAGE == "Train":
                         st.write(f'RMSE: {rmse:.4f}')
                         st.write(f'R2: {r2:.4f}')
 
+    # --- Quick User Input Prediction ---
+    st.markdown("---")
+    st.header("Quick User Input Prediction")
+    st.markdown("Run a fast prediction using a saved model on the latest rows for its ticker/horizon.")
+
+    import re, os
+    model_dir = str(MODELS_DIR)
+    model_files = [f for f in os.listdir(model_dir) if f.endswith('.joblib')]
+    if not model_files:
+        st.info("No trained models found in /models. Train a model first.")
+    else:
+        user_model_choice = st.selectbox('Select a trained model:', model_files, key='user_pred_model_choice')
+        # Parse info from filename like xgb_reg_AAPL_h1.joblib
+        m = re.match(r"(xgb|ann|svm|nb)_(class|reg)_([^_]+)_h(\d+)\.joblib$", user_model_choice)
+        info = None
+        if m:
+            fam, task, tk, h = m.groups()
+            info = {"family": fam, "task": task, "ticker": tk, "horizon": int(h)}
+            st.caption(f"Parsed — Ticker: {tk}, Horizon: {h} ({'days' if info['horizon']!=1 else 'day'}), Task: {task}")
+        else:
+            st.caption("Unrecognized filename pattern; attempting generic prediction.")
+
+        # Date window and N rows
+        up_start = st.text_input("Start date (YYYY-MM-DD)", "2018-01-01", key="user_pred_start")
+        up_end = st.text_input("End date (YYYY-MM-DD or empty)", "", key="user_pred_end")
+        N = st.slider("Rows to predict (latest N)", 1, 30, 5, key="user_pred_n")
+
+        if st.button("Run user prediction", key="user_pred_run"):
+            try:
+                model_path = os.path.join(model_dir, user_model_choice)
+                mdl = load_model(model_path)
+                # Determine ticker/horizon
+                ticker = info['ticker'] if info else None
+                horizon = info['horizon'] if info else 1
+                if not ticker:
+                    st.error("Could not infer ticker from filename. Use standard naming: family_task_TICKER_hN.joblib")
+                else:
+                    df_raw = get_ticker_data(ticker, start=up_start or None, end=up_end or None)
+                    if df_raw is None or df_raw.empty:
+                        st.error("No data for selection.")
+                    else:
+                        df_raw = prepare_df_numeric(df_raw)
+                        if info and info['task'] == 'class':
+                            df = create_class_labels(df_raw, horizon=horizon)
+                        else:
+                            df = create_reg_target(df_raw, horizon=horizon)
+                        df = add_basic_features(df)
+                        if df is None or df.empty:
+                            st.error("No valid data after feature engineering.")
+                        else:
+                            # Build features (numeric, exclude targets/labels/date)
+                            drop_cols = {'Date','Ticker','next_close','ret_next','label'}
+                            feats = [c for c in df.columns if c not in drop_cols and np.issubdtype(df[c].dtype, np.number)]
+                            if not feats:
+                                st.error("No numeric features available for prediction.")
+                            else:
+                                sub = df.tail(N).copy()
+                                if info and info['task'] == 'class':
+                                    preds = predict_with_model(mdl, sub, feats, is_classifier=True)
+                                    out = sub[['Date']].copy()
+                                    out['True_label'] = sub['label'] if 'label' in sub.columns else np.nan
+                                    out['Pred_label'] = preds
+                                    st.subheader('Classification — latest predictions')
+                                    st.dataframe(out)
+                                else:
+                                    preds = predict_with_model(mdl, sub, feats, is_classifier=False)
+                                    # Align lengths if needed
+                                    y_true = sub['next_close'] if 'next_close' in sub.columns else None
+                                    if y_true is not None:
+                                        k = min(len(preds), len(y_true))
+                                        y_true = y_true.iloc[-k:]
+                                        y_pred = np.array(preds)[-k:]
+                                        out = pd.DataFrame({
+                                            'Date': sub['Date'].iloc[-k:].values,
+                                            'Actual_next_close': y_true.values,
+                                            'Predicted_next_close': y_pred,
+                                            'AbsError': np.abs(y_true.values - y_pred)
+                                        })
+                                    else:
+                                        out = pd.DataFrame({
+                                            'Date': sub['Date'].tail(len(preds)).values,
+                                            'Predicted_next_close': np.array(preds)
+                                        })
+                                    st.subheader('Regression — latest predictions')
+                                    st.dataframe(out)
+            except Exception as e:
+                st.error(f"User prediction failed: {e}")
+
     # --- One-click Batch Evaluation ---
     st.markdown("---")
     st.header("One-click Batch Evaluation")

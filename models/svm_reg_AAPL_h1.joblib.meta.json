@@ -1,0 +1,18 @@
+{
+  "model_file": "svm_reg_AAPL_h1.joblib",
+  "model_type": "SVMRegressor",
+  "n_splits": 5,
+  "best_params": {
+    "svr__C": 10,
+    "svr__gamma": "scale",
+    "svr__kernel": "linear"
+  },
+  "best_score": 0.9537951288288176,
+  "train_rows": 1887,
+  "n_features": 33,
+  "train_started_utc": "2025-09-05T16:45:46.549204",
+  "train_finished_utc": "2025-09-05T16:45:58.212801",
+  "duration_sec": 11.663597,
+  "date_start": "2018-02-20 05:00:00",
+  "date_end": "2025-08-21 04:00:00"
+}
